@@ -123,6 +123,44 @@ def minimize_own_console():
         print("[WIN] minimize_own_console error:", e)
 
 
+def close_docker_console_windows():
+    """Закрывает видимые консольные окна, где в заголовке есть 'Docker'."""
+    if platform.system() != "Windows":
+        return
+    try:
+        user32 = ctypes.windll.user32
+
+        EnumWindows = user32.EnumWindows
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def callback(hwnd, lParam):
+            # только видимые окна
+            if not user32.IsWindowVisible(hwnd):
+                return True
+
+            # имя класса (фильтруем консоли)
+            cls_buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, cls_buf, 256)
+            if cls_buf.value != "ConsoleWindowClass":
+                return True
+
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length == 0:
+                return True
+
+            title_buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, title_buf, length + 1)
+            title = title_buf.value.lower()
+
+            if "docker" in title:
+                user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+            return True
+
+        EnumWindows(EnumWindowsProc(callback), 0)
+    except Exception as e:
+        print("[WIN] close_docker_console_windows error:", e)
+
+
 # --------------------------------------------------------------
 # SERVER / WARMUP
 # --------------------------------------------------------------
@@ -1076,9 +1114,13 @@ class VoiceRecorderApp:
 if __name__ == "__main__":
     noise_suppressor = NoiseSuppressor(FS)
     minimize_own_console()
+    close_docker_console_windows()
 
     root = tk.Tk()
     root.title("Whisper Voice Notes")
+
+    # через небольшой дилей — на случай, если окно Docker появляется чуть позже
+    root.after(1200, close_docker_console_windows)
 
     def quit_app():
         global recording, current_stream
