@@ -102,6 +102,7 @@ recording = False
 recording_lock = threading.Lock()
 current_stream = None
 recording_start_time = None
+noise_suppressor = None
 
 
 # --------------------------------------------------------------
@@ -172,6 +173,77 @@ def record_to_wav():
     write(temp, FS, audio.astype(np.float32))
     print("[AUDIO] size:", os.path.getsize(temp))
     return temp
+
+
+class NoiseSuppressor:
+    """Простой адаптивный шумодав: высокочастотный фильтр + мягкий гейт."""
+
+    def __init__(
+        self,
+        sample_rate: int,
+        cutoff_hz: float = 70.0,
+        gate_db_above_noise: float = 6.0,
+        adapt_rate: float = 0.02,
+    ):
+        dt = 1.0 / float(sample_rate)
+        rc = 1.0 / (2.0 * np.pi * cutoff_hz)
+        self.alpha = rc / (rc + dt)
+        self.gate_ratio = 10 ** (gate_db_above_noise / 20.0)
+        self.adapt_rate = adapt_rate
+        self.noise_floor = 1e-3
+        self.prev_x = None
+        self.prev_y = None
+
+    def _ensure_state(self, channels: int):
+        if self.prev_x is None or len(self.prev_x) != channels:
+            self.prev_x = np.zeros(channels, dtype=np.float32)
+            self.prev_y = np.zeros(channels, dtype=np.float32)
+
+    def process_chunk(self, chunk: np.ndarray) -> np.ndarray:
+        """
+        Возвращает chunk после простого подавления шума.
+
+        Шаги:
+        1) Высокочастотный фильтр удаляет гул/дрейф (RC high-pass).
+        2) Оцениваем RMS, адаптируем шумовой пол и мягко ослабляем сигнал,
+           если он не превосходит шумовой фон на gate_db_above_noise.
+        """
+
+        if chunk.ndim == 1:
+            frames, channels = len(chunk), 1
+            data = chunk.reshape(-1, 1)
+        else:
+            frames, channels = chunk.shape
+            data = chunk
+
+        self._ensure_state(channels)
+
+        hp = np.empty_like(data, dtype=np.float32)
+        alpha = self.alpha
+        prev_x = self.prev_x
+        prev_y = self.prev_y
+
+        for i in range(frames):
+            x = data[i]
+            y = alpha * (prev_y + x - prev_x)
+            hp[i] = y
+            prev_x = x
+            prev_y = y
+
+        self.prev_x = prev_x
+        self.prev_y = prev_y
+
+        rms = float(np.sqrt(np.mean(hp**2)))
+        self.noise_floor = (1.0 - self.adapt_rate) * self.noise_floor + self.adapt_rate * rms
+        gate_threshold = max(self.noise_floor * self.gate_ratio, 1e-6)
+
+        if rms < gate_threshold:
+            gain = rms / gate_threshold
+            hp *= gain
+
+        if chunk.ndim == 1:
+            return hp.reshape(-1)
+        return hp
 
 
 def load_wav_mono(path):
@@ -877,6 +949,7 @@ class VoiceRecorderApp:
             current_stream = sd.InputStream(
                 samplerate=FS,
                 channels=CHANNELS,
+                dtype="float32",
                 callback=self.audio_cb,
             )
             current_stream.start()
@@ -899,8 +972,11 @@ class VoiceRecorderApp:
 
     def audio_cb(self, data, frames, time_info, status):
         if recording:
+            chunk = data.copy()
+            if noise_suppressor:
+                chunk = noise_suppressor.process_chunk(chunk)
             with recording_lock:
-                audio_buffer.append(data.copy())
+                audio_buffer.append(chunk)
 
     def process_recording(self):
         try:
@@ -998,6 +1074,7 @@ class VoiceRecorderApp:
 # --------------------------------------------------------------
 
 if __name__ == "__main__":
+    noise_suppressor = NoiseSuppressor(FS)
     minimize_own_console()
 
     root = tk.Tk()
