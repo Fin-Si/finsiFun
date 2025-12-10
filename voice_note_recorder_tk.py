@@ -85,6 +85,8 @@ import socket
 import subprocess
 import platform
 import ctypes
+import difflib
+import re
 import numpy as np
 import sounddevice as sd
 from scipy.io.wavfile import write, read
@@ -265,9 +267,42 @@ def normalize_text(t):
     return " ".join(t.strip().lower().split())
 
 
-def fuzzy_stitch(prev, cur, max_words=15):
+def _best_overlap(prev_words, cur_words, max_words=20, hard_threshold=0.88, soft_threshold=0.8):
     """
-    Примитивная склейка по совпадающему хвосту/началу (по словам).
+    Подбирает лучший хвост/голову для сшивания.
+    Возвращает количество слов для отбрасывания из начала cur_words.
+    """
+
+    search_limit = min(max_words, len(prev_words), len(cur_words))
+    best_len = 0
+    best_ratio = 0.0
+
+    for k in range(search_limit, 0, -1):
+        tail = " ".join(prev_words[-k:])
+        head = " ".join(cur_words[:k])
+
+        norm_tail = normalize_text(tail)
+        norm_head = normalize_text(head)
+
+        if norm_tail == norm_head:
+            return k
+
+        ratio = difflib.SequenceMatcher(None, norm_tail, norm_head).ratio()
+
+        # "адаптивный" приём: для коротких окон достаточно чуть меньшего порога,
+        # а для длинных даём жёсткий.
+        adaptive_threshold = hard_threshold if k >= 6 else soft_threshold
+
+        if ratio >= adaptive_threshold and ratio > best_ratio:
+            best_len = k
+            best_ratio = ratio
+
+    return best_len
+
+
+def fuzzy_stitch(prev, cur, max_words=20, similarity_threshold=0.82):
+    """
+    Склейка по совпадающему хвосту/началу (по словам) c адаптивным подбором окна.
     """
     prev = prev or ""
     cur = cur or ""
@@ -279,11 +314,102 @@ def fuzzy_stitch(prev, cur, max_words=15):
     prev_words = prev.strip().split()
     cur_words = cur.strip().split()
 
-    n = min(max_words, len(prev_words), len(cur_words))
-    for k in range(n, 0, -1):
-        if normalize_text(" ".join(prev_words[-k:])) == normalize_text(" ".join(cur_words[:k])):
-            return prev + " " + " ".join(cur_words[k:])
+    overlap = _best_overlap(prev_words, cur_words, max_words=max_words, hard_threshold=similarity_threshold)
+    if overlap > 0:
+        return prev + " " + " ".join(cur_words[overlap:])
+
     return prev + " " + cur
+
+
+def deduplicate_sentences(
+    text: str, similarity_threshold: float = 0.9, history: int = 3
+) -> str:
+    """
+    Убирает подряд идущие дубли предложений/фраз (после чанкинга).
+    Делается без внешних зависимостей: SequenceMatcher + простая сегментация.
+    """
+
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+|\n+", text) if p.strip()]
+    cleaned = []
+    recent_norms = []
+
+    for part in parts:
+        norm = normalize_text(part)
+        if not norm:
+            continue
+        for prev in reversed(recent_norms):
+            if difflib.SequenceMatcher(None, prev, norm).ratio() >= similarity_threshold:
+                # слишком похоже на недавнюю фразу → считаем дублем
+                break
+        else:
+            cleaned.append(part)
+            recent_norms.append(norm)
+            if len(recent_norms) > history:
+                recent_norms.pop(0)
+
+    return "\n".join(cleaned)
+
+
+def restore_basic_punctuation(text: str) -> str:
+    """Добавляет минимальную пунктуацию и нормализует пробелы/регистры."""
+
+    sentences = [p.strip() for p in re.split(r"(?<=[.!?])\s+|\n+", text) if p.strip()]
+    restored = []
+
+    for sent in sentences:
+        # схлопываем пробелы внутри
+        sent_clean = re.sub(r"\s+", " ", sent).strip()
+        if not sent_clean:
+            continue
+
+        # капитализация начала
+        if sent_clean[0].isalpha():
+            sent_clean = sent_clean[0].upper() + sent_clean[1:]
+
+        # базовая пунктуация в конце
+        if sent_clean[-1] not in ".?!":
+            sent_clean += "."
+
+        restored.append(sent_clean)
+
+    return "\n".join(restored)
+
+
+def suppress_repeated_transcript_tail(
+    text: str,
+    similarity_threshold: float = 0.8,
+    min_sentences_per_half: int = 6,
+) -> str:
+    """
+    Если вторая половина текста почти совпадает с первой (частый случай
+    повторной транскрипции целиком), отбрасывает хвост и оставляет более
+    раннюю версию. Работает поверх deduplicate_sentences.
+    """
+
+    sentences = [p.strip() for p in re.split(r"(?<=[.!?])\s+|\n+", text) if p.strip()]
+    if len(sentences) < min_sentences_per_half * 2:
+        return text
+
+    mid = len(sentences) // 2
+    first_half = " ".join(sentences[:mid])
+    second_half = " ".join(sentences[mid:])
+
+    ratio = difflib.SequenceMatcher(
+        None, normalize_text(first_half), normalize_text(second_half)
+    ).ratio()
+    if ratio >= similarity_threshold:
+        return "\n".join(sentences[:mid]).strip()
+    return text
+
+
+def postprocess_transcript(text: str) -> str:
+    """Общий постпроцессинг: dedup + защита от повторной копии текста + пунктуация."""
+
+    cleaned = deduplicate_sentences(text)
+    cleaned = suppress_repeated_transcript_tail(cleaned)
+    cleaned = restore_basic_punctuation(cleaned)
+    cleaned = deduplicate_sentences(cleaned)
+    return cleaned.strip()
 
 
 # --------------------------------------------------------------
@@ -340,7 +466,7 @@ def transcribe_maybe_chunk(
 
     if duration <= chunk_threshold_sec:
         print("[CHUNK] Using single request")
-        return transcribe_single(file_path)
+        return postprocess_transcript(transcribe_single(file_path))
 
     print("[CHUNK] Using chunked mode")
     chunks = split_into_chunks(audio, sr, chunk_sec=DEFAULT_CHUNK_SEC, overlap_sec=DEFAULT_OVERLAP_SEC)
@@ -352,7 +478,7 @@ def transcribe_maybe_chunk(
         full_text = fuzzy_stitch(full_text, part)
         if progress_cb:
             progress_cb(i, total)
-    return full_text.strip()
+    return postprocess_transcript(full_text.strip())
 
 
 def transcribe(file_path: str, progress_cb=None, chunk_threshold_sec: float = 180.0) -> str:
