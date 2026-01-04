@@ -587,6 +587,9 @@ class MacroApp:
         self.btn_play.config(text="Play")
         self.set_mode("Idle", "black")
 
+        # Re-enable hotkeys after playback ends
+        self.resume_global_hotkeys()
+
         with self.events_lock:
             has_events = bool(self.events)
         self.set_status("Ready. Playback stopped." if has_events else "Ready.")
