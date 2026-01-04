@@ -163,10 +163,14 @@ class MacroApp:
         self.mouse_listener = None
         self.kb_listener = None
 
-        # GlobalHotKeys manager
-        self.hotkeys_manager = None
-        self.hotkeys_lock = threading.Lock()
-        self.hotkeys_suspended = False
+        # Global hotkey listener
+        self.hotkey_listener = None
+        self.hotkeys_enabled = True
+        self.hotkey_pressed_tokens = set()
+        self.record_hotkey_tokens = set()
+        self.play_hotkey_tokens = set()
+        self.record_hotkey_active = False
+        self.play_hotkey_active = False
 
         # Config vars
         cfg = self.load_config()
@@ -179,7 +183,8 @@ class MacroApp:
         self.build_ui()
 
         # Start global hotkeys
-        self.restart_global_hotkeys()
+        self.update_hotkey_tokens()
+        self.start_hotkey_listener()
 
         # Ensure clean exit
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -289,6 +294,7 @@ class MacroApp:
             messagebox.showwarning("Hotkey", "Stop playback before changing hotkeys.")
             return
 
+        self.hotkeys_enabled = False
         top = tk.Toplevel(self.root)
         top.title("Press hotkey…")
         top.geometry("360x120")
@@ -322,6 +328,7 @@ class MacroApp:
                     listener.stop()
                 except Exception:
                     pass
+                self.hotkeys_enabled = True
                 top.destroy()
 
         listener = keyboard.Listener(on_press=on_press, on_release=on_release)
@@ -333,6 +340,7 @@ class MacroApp:
                     listener.stop()
                 except Exception:
                     pass
+            self.hotkeys_enabled = True
             top.destroy()
 
         top.protocol("WM_DELETE_WINDOW", on_close)
@@ -350,56 +358,53 @@ class MacroApp:
     def apply_hotkeys(self):
         self.var_record_hotkey.set(normalize_hotkey_string(self.var_record_hotkey.get()))
         self.var_play_hotkey.set(normalize_hotkey_string(self.var_play_hotkey.get()))
-        self.restart_global_hotkeys()
+        self.update_hotkey_tokens()
         self.save_config()
         self.set_status("Hotkeys applied.")
 
-    def suspend_global_hotkeys(self):
-        with self.hotkeys_lock:
-            self.hotkeys_suspended = True
-            try:
-                if self.hotkeys_manager:
-                    self.hotkeys_manager.stop()
-            except Exception:
-                pass
+    def parse_hotkey_tokens(self, s: str) -> set[str]:
+        s = normalize_hotkey_string(s)
+        if not s:
+            return set()
+        return {p for p in s.split("+") if p}
 
-    def resume_global_hotkeys(self):
-        with self.hotkeys_lock:
-            self.hotkeys_suspended = False
-        # restart outside lock to avoid long lock holding
-        self.restart_global_hotkeys()
+    def update_hotkey_tokens(self):
+        self.record_hotkey_tokens = self.parse_hotkey_tokens(self.var_record_hotkey.get())
+        self.play_hotkey_tokens = self.parse_hotkey_tokens(self.var_play_hotkey.get())
+        if self.record_hotkey_tokens and self.record_hotkey_tokens == self.play_hotkey_tokens:
+            self.set_status("Warning: Record hotkey and Play hotkey are the same (change one).")
 
-    def restart_global_hotkeys(self):
-        with self.hotkeys_lock:
-            if self.hotkeys_suspended:
+    def start_hotkey_listener(self):
+        if self.hotkey_listener:
+            return
+
+        def on_press(k):
+            token = key_to_hotkey_token(k)
+            if not token:
                 return
-            try:
-                if self.hotkeys_manager:
-                    self.hotkeys_manager.stop()
-            except Exception:
-                pass
+            self.hotkey_pressed_tokens.add(token)
+            if not self.hotkeys_enabled:
+                return
+            if self.record_hotkey_tokens and self.record_hotkey_tokens.issubset(self.hotkey_pressed_tokens):
+                if not self.record_hotkey_active:
+                    self.record_hotkey_active = True
+                    self.root.after(0, self.toggle_recording)
+            if self.play_hotkey_tokens and self.play_hotkey_tokens.issubset(self.hotkey_pressed_tokens):
+                if not self.play_hotkey_active:
+                    self.play_hotkey_active = True
+                    self.root.after(0, self.toggle_playback)
 
-            rec = normalize_hotkey_string(self.var_record_hotkey.get())
-            play = normalize_hotkey_string(self.var_play_hotkey.get())
+        def on_release(k):
+            token = key_to_hotkey_token(k)
+            if token:
+                self.hotkey_pressed_tokens.discard(token)
+            if self.record_hotkey_active and not self.record_hotkey_tokens.issubset(self.hotkey_pressed_tokens):
+                self.record_hotkey_active = False
+            if self.play_hotkey_active and not self.play_hotkey_tokens.issubset(self.hotkey_pressed_tokens):
+                self.play_hotkey_active = False
 
-            if rec == play:
-                self.set_status("Warning: Record hotkey and Play hotkey are the same (change one).")
-
-            def safe_call(fn):
-                def _inner():
-                    self.root.after(0, fn)
-                return _inner
-
-            mapping = {
-                rec: safe_call(self.toggle_recording),
-                play: safe_call(self.toggle_playback),
-            }
-            try:
-                self.hotkeys_manager = keyboard.GlobalHotKeys(mapping)
-                self.hotkeys_manager.start()
-            except Exception as e:
-                self.hotkeys_manager = None
-                self.set_status(f"Failed to register hotkeys: {e}")
+        self.hotkey_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        self.hotkey_listener.start()
 
     # ---------- recording ----------
     def toggle_recording(self):
@@ -412,9 +417,6 @@ class MacroApp:
             self.stop_recording()
 
     def start_recording(self):
-        # Disable global hotkeys so record/play hotkeys won't be captured into macro
-        self.suspend_global_hotkeys()
-
         with self.events_lock:
             self.events.clear()
 
@@ -509,9 +511,6 @@ class MacroApp:
         self.mouse_listener = None
         self.kb_listener = None
 
-        # Re-enable global hotkeys after recording ends
-        self.resume_global_hotkeys()
-
         with self.events_lock:
             n = len(self.events)
         self.set_status(f"Recording stopped. Events captured: {n}")
@@ -542,9 +541,6 @@ class MacroApp:
             self.request_stop_playback()
 
     def start_playback(self):
-        # Disable global hotkeys so play hotkey won't get triggered by playback output
-        self.suspend_global_hotkeys()
-
         self.playing = True
         self.btn_play.config(text="Stop")
         self.set_mode("Playback", "green")
@@ -702,9 +698,8 @@ class MacroApp:
             pass
 
         try:
-            with self.hotkeys_lock:
-                if self.hotkeys_manager:
-                    self.hotkeys_manager.stop()
+            if self.hotkey_listener:
+                self.hotkey_listener.stop()
         except Exception:
             pass
 
