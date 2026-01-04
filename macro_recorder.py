@@ -72,12 +72,25 @@ for i in range(1, 25):
     SPECIAL_KEY_TO_HOTKEY[getattr(Key, f"f{i}")] = f"<f{i}>"
 
 
+def keycode_to_char(k: KeyCode) -> str | None:
+    if k.char and len(k.char) == 1 and k.char.isprintable():
+        return k.char.lower()
+    vk = getattr(k, "vk", None)
+    if vk is None:
+        return None
+    try:
+        candidate = chr(vk)
+    except (TypeError, ValueError):
+        return None
+    if len(candidate) != 1 or not candidate.isprintable():
+        return None
+    return candidate.lower()
+
+
 def key_to_hotkey_token(k) -> str | None:
     """Convert pynput key to GlobalHotKeys token."""
     if isinstance(k, KeyCode):
-        if k.char:
-            return k.char.lower()
-        return None
+        return keycode_to_char(k)
     if k in SPECIAL_KEY_TO_HOTKEY:
         return SPECIAL_KEY_TO_HOTKEY[k]
     return None
@@ -140,8 +153,8 @@ class MacroApp:
         # Throttle for mouse move
         self._last_move_t = 0.0
         self._last_move_xy = None
-        self.MOVE_THROTTLE_SEC = 0.01  # 10ms
-        self.MOVE_MIN_PIXELS = 1       # ignore subpixel/no movement
+        self.MOVE_THROTTLE_SEC = 0.005  # 5ms
+        self.MOVE_MIN_PIXELS = 0       # record all movement for accuracy
 
         self.mouse_ctrl = MouseController()
         self.kb_ctrl = KeyboardController()
@@ -225,6 +238,10 @@ class MacroApp:
         self.btn_clear.pack(side="left")
 
         self.status = tk.StringVar(value="Ready.")
+        self.mode = tk.StringVar(value="Idle")
+        self.mode_label = ttk.Label(frm, textvariable=self.mode)
+        self.mode_label.pack(fill="x", padx=12, pady=(2, 0))
+        self.set_mode("Idle", "black")
         ttk.Label(frm, textvariable=self.status).pack(fill="x", padx=12, pady=(2, 10))
 
         hint = (
@@ -235,6 +252,10 @@ class MacroApp:
 
     def set_status(self, s: str):
         self.status.set(s)
+
+    def set_mode(self, text: str, color: str):
+        self.mode.set(text)
+        self.mode_label.configure(foreground=color)
 
     # ---------- config ----------
     def load_config(self) -> dict:
@@ -404,6 +425,7 @@ class MacroApp:
 
         self.recording = True
         self.btn_record.config(text="Stop recording")
+        self.set_mode("Recording", "red")
         self.set_status("Recording… (use record hotkey to stop)")
 
         def stamp_dt_and_update_last():
@@ -471,6 +493,7 @@ class MacroApp:
     def stop_recording(self):
         self.recording = False
         self.btn_record.config(text="Start recording")
+        self.set_mode("Idle", "black")
 
         try:
             if self.mouse_listener:
@@ -524,6 +547,7 @@ class MacroApp:
 
         self.playing = True
         self.btn_play.config(text="Stop")
+        self.set_mode("Playback", "green")
         self.set_status("Playing… (use play hotkey to stop)")
 
         # snapshot events once per run loop (protect against clear/edit)
@@ -565,6 +589,7 @@ class MacroApp:
     def stop_playback_ui(self):
         self.playing = False
         self.btn_play.config(text="Play")
+        self.set_mode("Idle", "black")
 
         # Re-enable hotkeys after playback ends
         self.resume_global_hotkeys()
@@ -626,7 +651,13 @@ class MacroApp:
     # ---------- serialization ----------
     def serialize_key(self, k):
         if isinstance(k, KeyCode):
-            return {"type": "char", "value": k.char}
+            char = keycode_to_char(k)
+            if char:
+                return {"type": "char", "value": char}
+            vk = getattr(k, "vk", None)
+            if vk is not None:
+                return {"type": "vk", "value": vk}
+            return {"type": "unknown", "value": str(k)}
         elif isinstance(k, Key):
             return {"type": "key", "value": k.name}
         else:
@@ -645,6 +676,11 @@ class MacroApp:
             if not name:
                 return None
             return getattr(Key, name, None)
+        if d.get("type") == "vk":
+            value = d.get("value")
+            if value is None:
+                return None
+            return KeyCode.from_vk(value)
         return None
 
     def deserialize_mouse_button(self, s: str):
